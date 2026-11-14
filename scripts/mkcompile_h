@@ -3,6 +3,11 @@
 
 UTS_MACHINE=$1
 CC_VERSION="$2"
+# Keep the compiler version in the short "<name> version <version>" form:
+# the full text carries the toolchain URL inside parentheses, which breaks
+# userspace parsers that read /proc/version.
+CC_VERSION=$(printf '%s\n' "$CC_VERSION" |
+	sed -e 's/ ([^)]*)//g' -e 's/,.*$//' -e 's/[[:space:]]*$//')
 LD=$3
 
 if test -z "$KBUILD_BUILD_USER"; then
@@ -23,5 +28,5 @@ cat <<EOF
 #define UTS_MACHINE		"${UTS_MACHINE}"
 #define LINUX_COMPILE_BY	"${LINUX_COMPILE_BY}"
 #define LINUX_COMPILE_HOST	"${LINUX_COMPILE_HOST}"
-#define LINUX_COMPILER		"${CC_VERSION}, ${LD_VERSION}"
+#define LINUX_COMPILER		"${CC_VERSION}"
 EOF
