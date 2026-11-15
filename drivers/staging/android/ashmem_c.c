@@ -25,6 +25,10 @@
 #include <linux/bitops.h>
 #include <linux/mutex.h>
 #include <linux/shmem_fs.h>
+#include <linux/memfd.h>
+#include <linux/fcntl.h>
+#include <linux/dcache.h>
+#include <linux/string.h>
 #include "ashmem.h"
 
 /**
@@ -906,6 +910,19 @@ static long compat_ashmem_ioctl(struct file *file, unsigned int cmd,
 	case COMPAT_ASHMEM_SET_PROT_MASK:
 		cmd = ASHMEM_SET_PROT_MASK;
 		break;
+	case COMPAT_ASHMEM_GET_FILE_ID: {
+		struct ashmem_area *asma = file->private_data;
+		u32 ino;
+
+		mutex_lock(&ashmem_mutex);
+		if (!asma->file) {
+			mutex_unlock(&ashmem_mutex);
+			return -EINVAL;
+		}
+		ino = file_inode(asma->file)->i_ino;
+		mutex_unlock(&ashmem_mutex);
+		return put_user(ino, (u32 __user *)compat_ptr(arg)) ? -EFAULT : 0;
+	}
 	}
 	return ashmem_ioctl(file, cmd, arg);
 }
@@ -944,6 +961,136 @@ static const struct file_operations ashmem_fops = {
 	.show_fdinfo = ashmem_show_fdinfo,
 #endif
 };
+
+/*
+ * Helpers for other kernel code (and modules) that need to look into an
+ * ashmem file, as the Rust driver provides them.
+ */
+bool is_ashmem_file(struct file *file)
+{
+	return file && file->f_op == &ashmem_fops;
+}
+
+int ashmem_area_name(struct file *file, char *name)
+{
+	struct ashmem_area *asma;
+
+	if (!name || !is_ashmem_file(file))
+		return -EINVAL;
+
+	asma = file->private_data;
+	mutex_lock(&ashmem_mutex);
+	strscpy(name, asma->name, ASHMEM_FULL_NAME_LEN);
+	mutex_unlock(&ashmem_mutex);
+	return 0;
+}
+
+long ashmem_area_size(struct file *file)
+{
+	struct ashmem_area *asma;
+	long size;
+
+	if (!is_ashmem_file(file))
+		return 0;
+
+	asma = file->private_data;
+	mutex_lock(&ashmem_mutex);
+	size = asma->size;
+	mutex_unlock(&ashmem_mutex);
+	return size;
+}
+
+struct file *ashmem_area_vmfile(struct file *file)
+{
+	struct ashmem_area *asma;
+	struct file *vmfile = NULL;
+
+	if (!is_ashmem_file(file))
+		return NULL;
+
+	asma = file->private_data;
+	mutex_lock(&ashmem_mutex);
+	if (asma->file)
+		vmfile = get_file(asma->file);
+	mutex_unlock(&ashmem_mutex);
+	return vmfile;
+}
+
+/*
+ * libcutils hands out memfds where it used to hand out ashmem fds, and
+ * still issues ashmem ioctls on them. Answer those from the memfd itself,
+ * the way the Rust driver does: the name and size come from the file, the
+ * protection mask maps onto the write seals, and pinning is a no-op.
+ */
+long ashmem_memfd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	const unsigned int write_seals = F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+	long seals;
+
+	switch (cmd) {
+	case ASHMEM_GET_NAME: {
+		struct name_snapshot snap;
+		char name[ASHMEM_NAME_LEN];
+		const char *n;
+
+		take_dentry_name_snapshot(&snap, file->f_path.dentry);
+		n = snap.name.name;
+		if (str_has_prefix(n, "memfd:"))
+			n += strlen("memfd:");
+		strscpy(name, n, sizeof(name));
+		release_dentry_name_snapshot(&snap);
+		if (copy_to_user((void __user *)arg, name, strlen(name) + 1))
+			return -EFAULT;
+		return 0;
+	}
+	case ASHMEM_GET_SIZE:
+		return i_size_read(file_inode(file));
+	case ASHMEM_SET_PROT_MASK:
+		seals = memfd_fcntl(file, F_GET_SEALS, 0);
+		if (seals < 0)
+			return seals;
+		/* READ and EXEC cannot be taken away from a memfd */
+		if (!(seals & write_seals) && !(arg & PROT_WRITE)) {
+			seals = memfd_fcntl(file, F_ADD_SEALS, F_SEAL_FUTURE_WRITE);
+			if (seals < 0)
+				return seals;
+		} else if ((seals & write_seals) && (arg & PROT_WRITE)) {
+			return -EINVAL;
+		}
+		return 0;
+	case ASHMEM_GET_PROT_MASK:
+		seals = memfd_fcntl(file, F_GET_SEALS, 0);
+		if (seals < 0)
+			return seals;
+		return PROT_READ | PROT_EXEC | ((seals & write_seals) ? 0 : PROT_WRITE);
+	case ASHMEM_GET_FILE_ID: {
+		unsigned long ino = file_inode(file)->i_ino;
+
+		return copy_to_user((void __user *)arg, &ino, sizeof(ino)) ? -EFAULT : 0;
+	}
+#ifdef CONFIG_COMPAT
+	case COMPAT_ASHMEM_GET_FILE_ID:
+		return put_user((u32)file_inode(file)->i_ino,
+				(u32 __user *)compat_ptr(arg)) ? -EFAULT : 0;
+	case COMPAT_ASHMEM_SET_PROT_MASK:
+		return ashmem_memfd_ioctl(file, ASHMEM_SET_PROT_MASK, arg);
+	case COMPAT_ASHMEM_SET_SIZE:
+#endif
+	case ASHMEM_SET_NAME:
+	case ASHMEM_SET_SIZE:
+		/* libcutils names and sizes memfds itself */
+		return -EINVAL;
+	case ASHMEM_PIN:
+		return ASHMEM_NOT_PURGED;
+	case ASHMEM_UNPIN:
+		return 0;
+	case ASHMEM_GET_PIN_STATUS:
+		return ASHMEM_IS_PINNED;
+	case ASHMEM_PURGE_ALL_CACHES:
+		return capable(CAP_SYS_ADMIN) ? 0 : -EPERM;
+	}
+	return -ENOTTY;
+}
 
 static struct miscdevice ashmem_misc = {
 	.minor = MISC_DYNAMIC_MINOR,
