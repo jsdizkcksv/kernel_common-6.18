@@ -153,6 +153,7 @@ static int scs_handle_fde_frame(const struct eh_frame *frame,
 {
 	int size = frame->size - offsetof(struct eh_frame, opcodes) + 4;
 	u64 loc = (u64)offset_to_ptr(&frame->initial_loc);
+	u64 start = loc;
 	const u8 *opcode = frame->opcodes;
 	int l;
 
@@ -214,7 +215,17 @@ static int scs_handle_fde_frame(const struct eh_frame *frame,
 			break;
 
 		case DW_CFA_negate_ra_state:
-			if (!dry_run)
+			/*
+			 * The directive is expected to follow the PACIASP/AUTIASP
+			 * instruction it describes, so the instruction to patch is
+			 * the one at loc - 4. At the very start of an FDE there is
+			 * no such instruction: loc - 4 is outside the code range
+			 * covered by the FDE and, for the first function of a
+			 * module, may even be in the guard page below the module's
+			 * executable allocation. Reading it faults before
+			 * scs_patch_loc() can reject the value, so skip it.
+			 */
+			if (!dry_run && loc != start)
 				scs_patch_loc(loc - 4);
 			break;
 
